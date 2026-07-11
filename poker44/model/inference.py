@@ -1,0 +1,95 @@
+"""Runtime inference wrapper for the trained Poker44 bot-detection model.
+
+Loads the LightGBM booster + metadata produced by
+``scripts/miner/train_model.py`` and scores chunks. Falls back to a neutral
+mid-low score if the artifacts or lightgbm are unavailable so the miner
+never crashes a request.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from pathlib import Path
+
+import numpy as np
+
+from poker44.model.features import chunk_features
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_ARTIFACT_DIR = Path(__file__).resolve().parent / "artifacts"
+FALLBACK_SCORE = 0.25
+
+
+class DetectionModel:
+    """Chunk-level bot-risk scorer backed by a trained LightGBM model."""
+
+    def __init__(self, artifact_dir: Path | str = DEFAULT_ARTIFACT_DIR):
+        self.artifact_dir = Path(artifact_dir)
+        self.booster = None
+        self.feature_names: list[str] = []
+        self.pivot = 0.5
+        self._load()
+
+    def _load(self) -> None:
+        model_path = self.artifact_dir / "model.lgb.txt"
+        meta_path = self.artifact_dir / "model_meta.json"
+        try:
+            import lightgbm as lgb
+
+            meta = json.loads(meta_path.read_text())
+            self.feature_names = list(meta["feature_names"])
+            self.pivot = float(meta.get("calibration", {}).get("pivot", 0.5))
+            self.booster = lgb.Booster(model_file=str(model_path))
+            logger.info(
+                "detection model loaded: %s features, pivot=%.4f, trained on %s examples",
+                len(self.feature_names),
+                self.pivot,
+                meta.get("n_train_examples"),
+            )
+        except Exception as err:  # noqa: BLE001
+            self.booster = None
+            logger.error("detection model unavailable, using fallback: %s", err)
+
+    @property
+    def ready(self) -> bool:
+        return self.booster is not None
+
+    def _calibrate(self, raw: np.ndarray) -> np.ndarray:
+        pivot = min(max(self.pivot, 1e-6), 1.0 - 1e-6)
+        scaled = np.where(
+            raw <= pivot,
+            0.5 * raw / pivot,
+            0.5 + 0.5 * (raw - pivot) / (1.0 - pivot),
+        )
+        return np.clip(scaled, 0.0, 1.0)
+
+    def score_chunks(self, chunks: list[list[dict]]) -> list[float]:
+        """One calibrated bot-risk score in [0, 1] per chunk."""
+        if not chunks:
+            return []
+        if not self.ready:
+            return [FALLBACK_SCORE] * len(chunks)
+        try:
+            rows = []
+            degenerate = []
+            for chunk in chunks:
+                hands = chunk or []
+                # Empty/actionless chunks are out-of-distribution; score them
+                # neutral-low rather than risk flagging a human.
+                degenerate.append(
+                    not hands
+                    or not any((hand or {}).get("actions") for hand in hands)
+                )
+                feats = chunk_features(hands)
+                rows.append([feats.get(name, 0.0) for name in self.feature_names])
+            raw = self.booster.predict(np.asarray(rows, dtype=float))
+            calibrated = self._calibrate(np.asarray(raw))
+            return [
+                FALLBACK_SCORE if is_degenerate else round(float(score), 6)
+                for score, is_degenerate in zip(calibrated, degenerate)
+            ]
+        except Exception as err:  # noqa: BLE001
+            logger.error("model inference failed, using fallback: %s", err)
+            return [FALLBACK_SCORE] * len(chunks)
