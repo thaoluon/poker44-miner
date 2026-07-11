@@ -48,7 +48,7 @@ class Miner(BaseMinerNeuron):
             ],
             defaults={
                 "model_name": "poker44-lgbm-behavioral",
-                "model_version": "1.1.0",
+                "model_version": "1.2.0",
                 "framework": "lightgbm",
                 "license": "MIT",
                 "repo_url": "https://github.com/thaoluon/poker44-miner",

@@ -38,6 +38,27 @@ def _snap_bucket(value: float) -> int:
     return best_i
 
 
+def _norm_entropy(values: list) -> float:
+    """Shannon entropy of a sequence, normalized to [0,1] by log(#categories)."""
+    counts = Counter(values)
+    if len(counts) <= 1:
+        return 0.0
+    total = sum(counts.values())
+    ent = -sum((c / total) * math.log((c / total) + 1e-12) for c in counts.values())
+    return ent / math.log(len(counts))
+
+
+def _max_run_share(values: list) -> float:
+    """Longest run of an identical consecutive value / length (regularity tell)."""
+    if not values:
+        return 0.0
+    longest = cur = 1
+    for prev, nxt in zip(values, values[1:]):
+        cur = cur + 1 if prev == nxt else 1
+        longest = max(longest, cur)
+    return longest / len(values)
+
+
 def _safe(value, default=0.0) -> float:
     try:
         out = float(value)
@@ -174,6 +195,46 @@ def hand_features(hand: dict) -> dict:
     for p in players:
         if p.get("seat") == hero_seat and p.get("showed_hand"):
             feats["hero_showed"] = 1.0
+
+    # ---- rank-1-derived structural signals (composition, not order) ----
+    action_types = [a.get("action_type") or "" for a in actions]
+    actor_seats = [a.get("actor_seat") for a in actions if a.get("actor_seat")]
+    street_names = [a.get("street") or "" for a in actions]
+    n_act = max(1, len(actions))
+
+    feats["action_entropy"] = _norm_entropy(action_types)
+    feats["actor_entropy"] = _norm_entropy(actor_seats)
+    feats["street_entropy"] = _norm_entropy(street_names)
+    feats["action_run_max_share"] = _max_run_share(action_types)
+    feats["actor_run_max_share"] = _max_run_share(actor_seats)
+    feats["actor_switch_rate"] = (
+        sum(1 for p, n in zip(actor_seats, actor_seats[1:]) if p != n)
+        / max(1, len(actor_seats) - 1)
+    )
+    feats["unique_actor_share"] = len(set(actor_seats)) / max(1, len(players))
+    feats["seat_utilization"] = len(players) / max(1, _safe(metadata.get("max_seats"), 6))
+
+    pots_after_seq = [_safe(a.get("pot_after")) for a in actions]
+    feats["pot_monotonic_rate"] = (
+        sum(1 for p, n in zip(pots_after_seq, pots_after_seq[1:]) if n + 1e-9 >= p)
+        / max(1, len(pots_after_seq) - 1)
+    )
+    if pots_after_seq and pots_before:
+        feats["pot_growth_bb"] = max(pots_after_seq) - min(pots_before)
+    else:
+        feats["pot_growth_bb"] = 0.0
+
+    feats["raise_to_share"] = sum(1 for a in actions if a.get("raise_to") is not None) / n_act
+    feats["call_to_share"] = sum(1 for a in actions if a.get("call_to") is not None) / n_act
+    feats["nonzero_amount_share"] = sum(1 for a in actions if _safe(a.get("normalized_amount_bb")) > 0) / n_act
+
+    button_seat = metadata.get("button_seat")
+    feats["button_action_share"] = (
+        sum(1 for s in actor_seats if s == button_seat) / n_act
+        if isinstance(button_seat, int)
+        else 0.0
+    )
+    feats["hero_button_same"] = 1.0 if (hero_seat and hero_seat == button_seat) else 0.0
 
     return feats
 
@@ -436,6 +497,26 @@ def chunk_features(chunk: list[dict]) -> dict:
     feats["chunk_anomaly_load"] = (
         acted_after_fold + street_regression + street_jump + zero_amt_betraise + pot_mismatch
     ) / denom
+
+    # ---- Threshold-crossing hand-rate features (rank-1 nonlinear indicators) ----
+    # Fraction of hands whose per-hand stat crosses a hard threshold — cheap
+    # pre-binned signals trees exploit well. Composition-based, not order-based.
+    n_hands_f = max(1, len(per_hand))
+    feats["rate_high_aggression"] = (
+        sum(1 for h in per_hand if h.get("aggression", 0.0) >= 0.35) / n_hands_f
+    )
+    feats["rate_low_action_entropy"] = (
+        sum(1 for h in per_hand if h.get("action_entropy", 0.0) <= 0.35) / n_hands_f
+    )
+    feats["rate_high_actor_entropy"] = (
+        sum(1 for h in per_hand if h.get("actor_entropy", 0.0) >= 0.75) / n_hands_f
+    )
+    feats["rate_long_action_hand"] = (
+        sum(1 for h in per_hand if h.get("n_actions", 0.0) >= 12.0) / n_hands_f
+    )
+    feats["rate_high_monotonic"] = (
+        sum(1 for h in per_hand if h.get("pot_monotonic_rate", 0.0) >= 0.99) / n_hands_f
+    )
 
     # NOTE: temporal/session-drift features (autocorrelation, trend slope,
     # quartile drift over hand order) were tested and REJECTED — they exploit
