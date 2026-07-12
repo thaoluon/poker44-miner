@@ -30,6 +30,8 @@ class DetectionModel:
         self.booster = None
         self.feature_names: list[str] = []
         self.pivot = 0.5
+        self.seq_scorer = None
+        self.seq_weight = 0.0
         self._load()
 
     def _load(self) -> None:
@@ -48,6 +50,19 @@ class DetectionModel:
                 self.pivot,
                 meta.get("n_train_examples"),
             )
+            # Optional sequence-model blend (orthogonal action-order signal).
+            weight = float(meta.get("sequence_blend_weight", 0.0) or 0.0)
+            seq_path = self.artifact_dir / "sequence.pt"
+            if weight > 0.0 and seq_path.exists():
+                from poker44.model.sequence import SequenceScorer
+
+                scorer = SequenceScorer(seq_path)
+                if scorer.ready:
+                    self.seq_scorer = scorer
+                    self.seq_weight = weight
+                    logger.info("sequence blend active: weight=%.2f", weight)
+                else:
+                    logger.warning("sequence weights present but torch unavailable; LGBM-only")
         except Exception as err:  # noqa: BLE001
             self.booster = None
             logger.error("detection model unavailable, using fallback: %s", err)
@@ -84,8 +99,16 @@ class DetectionModel:
                 )
                 feats = chunk_features(hands)
                 rows.append([feats.get(name, 0.0) for name in self.feature_names])
-            raw = self.booster.predict(np.asarray(rows, dtype=float))
-            calibrated = self._calibrate(np.asarray(raw))
+            raw = np.asarray(self.booster.predict(np.asarray(rows, dtype=float)))
+            # Blend in the sequence model where available (best-effort).
+            if self.seq_scorer is not None and self.seq_weight > 0.0:
+                try:
+                    seq = np.asarray(self.seq_scorer.score(chunks), dtype=float)
+                    if seq.shape == raw.shape:
+                        raw = self.seq_weight * seq + (1.0 - self.seq_weight) * raw
+                except Exception as err:  # noqa: BLE001
+                    logger.error("sequence blend failed, LGBM-only: %s", err)
+            calibrated = self._calibrate(raw)
             return [
                 FALLBACK_SCORE if is_degenerate else round(float(score), 6)
                 for score, is_degenerate in zip(calibrated, degenerate)

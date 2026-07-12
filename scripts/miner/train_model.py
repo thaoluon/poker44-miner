@@ -32,6 +32,20 @@ from poker44.model.features import chunk_features  # noqa: E402
 from poker44.score.scoring import reward  # noqa: E402
 from poker44.validator.payload_view import prepare_hand_for_miner  # noqa: E402
 
+try:
+    from poker44.model.sequence import (  # noqa: E402
+        encode_chunk,
+        train_sequence,
+        predict_sequence,
+        BLEND_SEQ_WEIGHT,
+    )
+    import torch  # noqa: F401,E402
+
+    _SEQ_AVAILABLE = True
+except Exception:  # noqa: BLE001
+    _SEQ_AVAILABLE = False
+    BLEND_SEQ_WEIGHT = 0.0
+
 
 def to_miner_view(group: list[dict]) -> list[dict]:
     """Project raw benchmark hands through the validator's miner-visible
@@ -66,8 +80,8 @@ LGB_PARAMS = {
 }
 
 
-def load_dataset(data_dir: Path):
-    rows, labels, dates, splits = [], [], [], []
+def load_dataset(data_dir: Path, encode: bool = False):
+    rows, labels, dates, splits, encoded = [], [], [], [], []
     for date_dir in sorted(data_dir.iterdir()):
         if not date_dir.is_dir():
             continue
@@ -81,7 +95,10 @@ def load_dataset(data_dir: Path):
                 print(f"skip {path.name}: {len(groups)} groups vs {len(truth)} labels")
                 continue
             for group, label in zip(groups, truth):
-                rows.append(chunk_features(to_miner_view(group)))
+                viewed = to_miner_view(group)
+                rows.append(chunk_features(viewed))
+                if encode and _SEQ_AVAILABLE:
+                    encoded.append(encode_chunk(viewed))
                 labels.append(int(label))
                 dates.append(date_dir.name)
                 splits.append(payload.get("split") or "train")
@@ -89,7 +106,29 @@ def load_dataset(data_dir: Path):
     X = np.asarray(
         [[row.get(k, 0.0) for k in feature_names] for row in rows], dtype=float
     )
-    return X, np.asarray(labels), np.asarray(dates), np.asarray(splits), feature_names
+    result = (X, np.asarray(labels), np.asarray(dates), np.asarray(splits), feature_names)
+    if encode:
+        return result + (encoded,)
+    return result
+
+
+def _sequence_oof(encoded, y, dates, folds):
+    """Leave-date-out out-of-fold sequence probabilities."""
+    oof = np.full(len(y), np.nan)
+    for fold_dates in folds:
+        mask = np.isin(dates, fold_dates)
+        tr = np.where(~mask)[0]
+        rng = np.random.RandomState(0)
+        rng.shuffle(tr)
+        cut = int(len(tr) * 0.85)
+        trn, val = tr[:cut], tr[cut:]
+        model = train_sequence(
+            [encoded[i] for i in trn], y[trn],
+            [encoded[i] for i in val], y[val],
+        )
+        te = np.where(mask)[0]
+        oof[te] = predict_sequence(model, [encoded[i] for i in te])
+    return oof
 
 
 def fit_model(X, y):
@@ -143,11 +182,15 @@ def main() -> None:
     parser.add_argument("--out", default="poker44/model/artifacts")
     args = parser.parse_args()
 
-    X, y, dates, splits, feature_names = load_dataset(Path(args.data_dir))
+    X, y, dates, splits, feature_names, encoded = load_dataset(
+        Path(args.data_dir), encode=True
+    )
+    seq_weight = BLEND_SEQ_WEIGHT if _SEQ_AVAILABLE else 0.0
     print(
         f"dataset: {len(y)} chunk groups, {X.shape[1]} features, "
         f"{int(y.sum())} bot / {int((y == 0).sum())} human, "
-        f"{len(set(dates.tolist()))} release dates"
+        f"{len(set(dates.tolist()))} release dates | "
+        f"sequence blend={'on' if seq_weight else 'off'} (w={seq_weight})"
     )
 
     # --- Leave-date-out CV (big dates individually, small dates in one fold).
@@ -156,17 +199,25 @@ def main() -> None:
     small_dates = [d for d in unique_dates if d not in big_dates]
     folds = [[d] for d in big_dates] + ([small_dates] if small_dates else [])
 
-    # Pass 1: collect raw out-of-fold scores.
-    oof_raw = np.full(len(y), np.nan)
+    # Pass 1: collect raw out-of-fold LGBM scores.
+    oof_lgb = np.full(len(y), np.nan)
     fold_masks = []
     for fold_dates in folds:
         mask = np.isin(dates, fold_dates)
         fold_masks.append((fold_dates, mask))
         model = fit_model(X[~mask], y[~mask])
-        oof_raw[mask] = model.predict_proba(X[mask])[:, 1]
-    assert not np.isnan(oof_raw).any()
+        oof_lgb[mask] = model.predict_proba(X[mask])[:, 1]
+    assert not np.isnan(oof_lgb).any()
 
-    # Pass 2: single global pivot from OOF human scores, then evaluate.
+    # Blend with out-of-fold sequence-model scores (orthogonal action-order signal).
+    if seq_weight:
+        print("training sequence model per fold (out-of-fold)...")
+        oof_seq = _sequence_oof(encoded, y, dates, folds)
+        oof_raw = seq_weight * oof_seq + (1.0 - seq_weight) * oof_lgb
+    else:
+        oof_raw = oof_lgb
+
+    # Pass 2: single global pivot from blended OOF human scores, then evaluate.
     calib = calibrate(oof_raw, y)
     oof_scores = apply_calibration(oof_raw, calib)
     print(f"\ncalibration pivot (from OOF): {calib['pivot']:.4f}")
@@ -182,16 +233,43 @@ def main() -> None:
     if (splits == "validation").any():
         tr, va = splits != "validation", splits == "validation"
         model = fit_model(X[tr], y[tr])
-        va_scores = apply_calibration(model.predict_proba(X[va])[:, 1], calib)
+        va_lgb = model.predict_proba(X[va])[:, 1]
+        if seq_weight:
+            tr_idx = np.where(tr)[0]
+            rng = np.random.RandomState(0)
+            rng.shuffle(tr_idx)
+            cut = int(len(tr_idx) * 0.85)
+            sm = train_sequence(
+                [encoded[i] for i in tr_idx[:cut]], y[tr_idx[:cut]],
+                [encoded[i] for i in tr_idx[cut:]], y[tr_idx[cut:]],
+            )
+            va_seq = predict_sequence(sm, [encoded[i] for i in np.where(va)[0]])
+            va_raw = seq_weight * va_seq + (1.0 - seq_weight) * va_lgb
+        else:
+            va_raw = va_lgb
         print("\napi split validation:")
-        evaluate(va_scores, y[va], "api validation")
+        evaluate(apply_calibration(va_raw, calib), y[va], "api validation")
 
-    # --- Final model on everything; keep the OOF-derived pivot.
+    # --- Final models on everything; keep the OOF-derived pivot.
     final_model = fit_model(X, y)
 
     out_dir = Path(args.out)
     out_dir.mkdir(parents=True, exist_ok=True)
     final_model.booster_.save_model(str(out_dir / "model.lgb.txt"))
+
+    seq_path_saved = False
+    if seq_weight:
+        idx = np.arange(len(y))
+        rng = np.random.RandomState(0)
+        rng.shuffle(idx)
+        cut = int(len(idx) * 0.9)
+        final_seq = train_sequence(
+            [encoded[i] for i in idx[:cut]], y[idx[:cut]],
+            [encoded[i] for i in idx[cut:]], y[idx[cut:]],
+        )
+        torch.save(final_seq.state_dict(), str(out_dir / "sequence.pt"))
+        seq_path_saved = True
+
     (out_dir / "model_meta.json").write_text(
         json.dumps(
             {
@@ -200,11 +278,12 @@ def main() -> None:
                 "n_train_examples": int(len(y)),
                 "release_dates": unique_dates,
                 "lgb_params": LGB_PARAMS,
+                "sequence_blend_weight": float(seq_weight) if seq_path_saved else 0.0,
             },
             indent=2,
         )
     )
-    print(f"saved model + meta to {out_dir}")
+    print(f"saved model + meta to {out_dir} (sequence={'yes' if seq_path_saved else 'no'})")
 
     importances = sorted(
         zip(feature_names, final_model.feature_importances_),

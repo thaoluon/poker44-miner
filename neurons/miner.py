@@ -45,10 +45,11 @@ class Miner(BaseMinerNeuron):
                 Path(__file__).resolve(),
                 repo_root / "poker44" / "model" / "features.py",
                 repo_root / "poker44" / "model" / "inference.py",
+                repo_root / "poker44" / "model" / "sequence.py",
             ],
             defaults={
                 "model_name": "poker44-lgbm-behavioral",
-                "model_version": "1.2.0",
+                "model_version": "1.3.0",
                 "framework": "lightgbm",
                 "license": "MIT",
                 "repo_url": "https://github.com/thaoluon/poker44-miner",
