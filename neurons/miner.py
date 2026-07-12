@@ -11,6 +11,7 @@ import bittensor as bt
 
 from poker44.base.miner import BaseMinerNeuron
 from poker44.model.inference import DetectionModel
+from poker44.model.live_log import LiveChunkLogger
 from poker44.utils.model_manifest import (
     build_local_model_manifest,
     evaluate_manifest_compliance,
@@ -34,6 +35,7 @@ class Miner(BaseMinerNeuron):
         bt.logging.info("🤖 Poker44 LightGBM Miner started")
         repo_root = Path(__file__).resolve().parents[1]
         self.detection_model = DetectionModel()
+        self.live_logger = LiveChunkLogger()
         bt.logging.info(
             f"Detection model ready: {self.detection_model.ready} "
             f"(pivot={self.detection_model.pivot:.4f}, "
@@ -49,7 +51,7 @@ class Miner(BaseMinerNeuron):
             ],
             defaults={
                 "model_name": "poker44-lgbm-behavioral",
-                "model_version": "1.3.0",
+                "model_version": "1.3.1",
                 "framework": "lightgbm",
                 "license": "MIT",
                 "repo_url": "https://github.com/thaoluon/poker44-miner",
@@ -118,6 +120,8 @@ class Miner(BaseMinerNeuron):
         synapse.risk_scores = scores
         synapse.predictions = [s >= 0.5 for s in scores]
         synapse.model_manifest = dict(self.model_manifest)
+        # Best-effort: record the real live chunk distribution for domain adaptation.
+        self.live_logger.log(chunks, scores)
         bt.logging.info(f"Miner Predictions: {synapse.predictions}")
         bt.logging.info(
             f"Scored {len(chunks)} chunks "
