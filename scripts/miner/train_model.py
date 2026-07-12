@@ -112,6 +112,34 @@ def load_dataset(data_dir: Path, encode: bool = False):
     return result
 
 
+def _live_pivot(lgb_model, seq_model, feature_names, seq_weight, target_flag=0.10):
+    """Pivot that flags ~target_flag of REAL logged live chunks (rank-preserving
+    operating-point fix for the benchmark->live score shift). None if no data."""
+    live_path = Path("data/live_chunks/live_chunks.jsonl")
+    if not live_path.exists():
+        return None
+    try:
+        chunks = []
+        for line in live_path.read_text().splitlines():
+            if line.strip():
+                chunks.append((json.loads(line).get("hands")) or [])
+        if len(chunks) < 200:
+            return None
+        rows = np.asarray(
+            [[chunk_features(c).get(n, 0.0) for n in feature_names] for c in chunks],
+            dtype=float,
+        )
+        raw = np.asarray(lgb_model.predict_proba(rows)[:, 1])
+        if seq_weight and seq_model is not None:
+            seq = predict_sequence(seq_model, [encode_chunk(c) for c in chunks])
+            raw = seq_weight * seq + (1.0 - seq_weight) * raw
+        pivot = float(np.percentile(raw, (1.0 - target_flag) * 100))
+        return min(max(pivot, 0.05), 0.95)
+    except Exception as err:  # noqa: BLE001
+        print(f"live pivot skipped: {err}")
+        return None
+
+
 def _sequence_oof(encoded, y, dates, folds):
     """Leave-date-out out-of-fold sequence probabilities."""
     oof = np.full(len(y), np.nan)
@@ -258,6 +286,7 @@ def main() -> None:
     final_model.booster_.save_model(str(out_dir / "model.lgb.txt"))
 
     seq_path_saved = False
+    final_seq = None
     if seq_weight:
         idx = np.arange(len(y))
         rng = np.random.RandomState(0)
@@ -269,6 +298,16 @@ def main() -> None:
         )
         torch.save(final_seq.state_dict(), str(out_dir / "sequence.pt"))
         seq_path_saved = True
+
+    # --- Live-aware calibration: the operating point (0.5 threshold) must sit
+    # on the REAL live distribution, not the benchmark (live scores run high, so
+    # the benchmark pivot over-flags ~28% -> hurts the human-safety gate). If we
+    # have logged live chunks, set the pivot to flag ~10% of live chunks. This
+    # is rank-preserving (AP/recall unchanged); only the 0.5 boundary moves.
+    live_pivot = _live_pivot(final_model, final_seq, feature_names, seq_weight)
+    if live_pivot is not None:
+        print(f"live-aware pivot: {calib['pivot']:.4f} -> {live_pivot:.4f} (flag ~10% on live)")
+        calib = {"pivot": live_pivot, "pivot_source": "live_p90_flag10pct"}
 
     (out_dir / "model_meta.json").write_text(
         json.dumps(
