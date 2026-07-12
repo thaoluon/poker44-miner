@@ -152,6 +152,10 @@ def leaderboard_standing() -> dict:
             "top10_cutline": cutline,
         }
         if mine:
+            windows = [
+                w.get("compositeScore")
+                for w in (mine.get("windowCompositeScores") or [])
+            ]
             out.update(
                 {
                     "rank": mine.get("rank"),
@@ -160,6 +164,9 @@ def leaderboard_standing() -> dict:
                     "score_source": mine.get("scoreSource"),
                     "manifest_present": mine.get("manifestPresent"),
                     "compliance": mine.get("complianceStatus"),
+                    "incentive": mine.get("incentive"),
+                    "windows": windows,
+                    "windows_scored": sum(1 for w in windows if w is not None),
                 }
             )
         return out
@@ -250,12 +257,44 @@ def main() -> None:
         elif "rank" in board:
             board_msg = (
                 f"LEADERBOARD rank={board['rank']} composite={board['composite']} "
-                f"reporting_validators={board['reporting_validators']} "
-                f"source={board['score_source']} | top10_cutline={board['top10_cutline']} "
-                f"epoch_ends={board['epoch_ends']}"
+                f"incentive={board.get('incentive')} "
+                f"windows_scored={board.get('windows_scored')}/5 "
+                f"reporting_validators={board['reporting_validators']} | "
+                f"top10_cutline={board['top10_cutline']} epoch_ends={board['epoch_ends']}"
             )
         else:
             board_msg = "leaderboard: UID 186 not listed"
+
+        # --- Change detection: alert on new window score, composite move, or
+        #     first nonzero incentive. Written prominently to monitor.log +
+        #     a dedicated alerts file.
+        prev = state.get("leaderboard") or {}
+        alerts = []
+        if "rank" in board:
+            pw = prev.get("windows_scored", 0) or 0
+            cw = board.get("windows_scored", 0) or 0
+            if cw > pw:
+                new_scores = [w for w in (board.get("windows") or []) if w is not None]
+                alerts.append(
+                    f"NEW WINDOW SCORED ({pw}->{cw}) | windows={new_scores} | "
+                    f"composite={board.get('composite')} vs top10_cutline={board.get('top10_cutline')}"
+                )
+            pc, cc = prev.get("composite"), board.get("composite")
+            if isinstance(pc, (int, float)) and isinstance(cc, (int, float)) and abs(cc - pc) >= 0.003:
+                direction = "UP" if cc > pc else "DOWN"
+                cut = board.get("top10_cutline")
+                gap = f"{cc - cut:+.4f} vs top10" if isinstance(cut, (int, float)) else ""
+                alerts.append(f"COMPOSITE {direction} {pc:.4f}->{cc:.4f} {gap}")
+            pi, ci = prev.get("incentive") or 0, board.get("incentive") or 0
+            if ci > 1e-6 and pi <= 1e-6:
+                alerts.append(f"INCENTIVE STARTED: {ci:.6f} 🎉")
+        for a in alerts:
+            log_line(f"🔔 ALERT | {a}")
+            try:
+                with (DATA_DIR / "alerts.log").open("a") as fh:
+                    fh.write(f"{_now()} | {a}\n")
+            except Exception:  # noqa: BLE001
+                pass
 
         latest = latest_release_date()
         retrain_msg = maybe_retrain(latest)
