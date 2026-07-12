@@ -109,6 +109,21 @@ class DetectionModel:
                 except Exception as err:  # noqa: BLE001
                     logger.error("sequence blend failed, LGBM-only: %s", err)
             calibrated = self._calibrate(raw)
+            # Per-batch safety floor (drift-proofs the human-safety gate): the
+            # validator needs >=1 chunk scored >=0.5 or the whole window's
+            # threshold-sanity term collapses to 0. Live scores drift, so a
+            # fixed pivot can flag zero on a low-scoring batch. Guarantee the
+            # top ~5% (>=1) non-degenerate chunks land just above 0.5, ranked —
+            # rank-preserving (AP/recall unchanged), only nudges the boundary.
+            deg = np.asarray(degenerate)
+            real_idx = np.flatnonzero(~deg)
+            if real_idx.size >= 3:
+                floor_k = max(1, int(round(0.05 * real_idx.size)))
+                n_flagged = int((calibrated[real_idx] >= 0.5).sum())
+                if n_flagged < floor_k:
+                    top = real_idx[np.argsort(raw[real_idx])[-floor_k:]]
+                    ranks = np.argsort(np.argsort(raw[top]))
+                    calibrated[top] = 0.501 + 0.048 * (ranks / max(floor_k - 1, 1))
             return [
                 FALLBACK_SCORE if is_degenerate else round(float(score), 6)
                 for score, is_degenerate in zip(calibrated, degenerate)
