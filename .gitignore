@@ -221,3 +221,6 @@ data/
 
 # Trained model artifacts (code-only repo; regenerate via train_model.py)
 poker44/model/artifacts/
+
+# CatBoost training scratch
+catboost_info/
