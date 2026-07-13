@@ -532,3 +532,39 @@ def feature_vector(chunk: list[dict], feature_names: list[str]) -> np.ndarray:
     """Fixed-order numeric vector for model inference."""
     feats = chunk_features(chunk)
     return np.asarray([feats.get(name, 0.0) for name in feature_names], dtype=float)
+
+
+def batch_relative_matrix(absolute: np.ndarray) -> np.ndarray:
+    """Within-batch rank-percentile of each feature column — a second, decorrelated
+    feature view that is INVARIANT to monotone magnitude rescaling. This survives
+    the benchmark(~230bb)->live(~100bb) shift where absolute features drift.
+    Rows = chunks in one batch, cols = features."""
+    n = absolute.shape[0]
+    if n < 2:
+        return np.full_like(absolute, 0.5)
+    try:
+        from scipy.stats import rankdata
+
+        out = np.empty_like(absolute, dtype=float)
+        for j in range(absolute.shape[1]):
+            out[:, j] = (rankdata(absolute[:, j]) - 1.0) / (n - 1)
+        return out
+    except Exception:  # noqa: BLE001
+        # numpy fallback (ordinal ranks) if scipy unavailable.
+        order = np.argsort(np.argsort(absolute, axis=0, kind="mergesort"), axis=0)
+        return order / max(n - 1, 1)
+
+
+def build_feature_matrix(
+    chunks: list, feature_names: list[str], use_relative: bool
+) -> np.ndarray:
+    """Absolute feature matrix, optionally concatenated with the within-batch
+    relative view. Used identically at train time (per-date batch) and inference
+    time (per-query batch)."""
+    absolute = np.asarray(
+        [[chunk_features(c or []).get(n, 0.0) for n in feature_names] for c in chunks],
+        dtype=float,
+    )
+    if not use_relative or absolute.shape[0] == 0:
+        return absolute
+    return np.hstack([absolute, batch_relative_matrix(absolute)])

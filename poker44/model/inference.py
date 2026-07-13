@@ -32,6 +32,7 @@ class DetectionModel:
         self.pivot = 0.5
         self.seq_scorer = None
         self.seq_weight = 0.0
+        self.use_relative = False
         self._load()
 
     def _load(self) -> None:
@@ -44,10 +45,12 @@ class DetectionModel:
             self.feature_names = list(meta["feature_names"])
             self.pivot = float(meta.get("calibration", {}).get("pivot", 0.5))
             self.booster = lgb.Booster(model_file=str(model_path))
+            self.use_relative = bool(meta.get("use_relative", False))
             logger.info(
-                "detection model loaded: %s features, pivot=%.4f, trained on %s examples",
+                "detection model loaded: %s features, pivot=%.4f, relative=%s, trained on %s examples",
                 len(self.feature_names),
                 self.pivot,
+                self.use_relative,
                 meta.get("n_train_examples"),
             )
             # Optional sequence-model blend (orthogonal action-order signal).
@@ -87,19 +90,16 @@ class DetectionModel:
         if not self.ready:
             return [FALLBACK_SCORE] * len(chunks)
         try:
-            rows = []
-            degenerate = []
-            for chunk in chunks:
-                hands = chunk or []
-                # Empty/actionless chunks are out-of-distribution; score them
-                # neutral-low rather than risk flagging a human.
-                degenerate.append(
-                    not hands
-                    or not any((hand or {}).get("actions") for hand in hands)
-                )
-                feats = chunk_features(hands)
-                rows.append([feats.get(name, 0.0) for name in self.feature_names])
-            raw = np.asarray(self.booster.predict(np.asarray(rows, dtype=float)))
+            from poker44.model.features import build_feature_matrix
+
+            degenerate = [
+                not (chunk or [])
+                or not any((hand or {}).get("actions") for hand in (chunk or []))
+                for chunk in chunks
+            ]
+            # Absolute + (per-batch) relative view, matching training.
+            rows = build_feature_matrix(chunks, self.feature_names, self.use_relative)
+            raw = np.asarray(self.booster.predict(rows))
             # Blend in the sequence model where available (best-effort).
             if self.seq_scorer is not None and self.seq_weight > 0.0:
                 try:
