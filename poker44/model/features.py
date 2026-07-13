@@ -561,10 +561,11 @@ def build_feature_matrix(
     """Absolute feature matrix, optionally concatenated with the within-batch
     relative view. Used identically at train time (per-date batch) and inference
     time (per-query batch)."""
-    absolute = np.asarray(
-        [[chunk_features(c or []).get(n, 0.0) for n in feature_names] for c in chunks],
-        dtype=float,
-    )
+    rows = []
+    for c in chunks:
+        feats = chunk_features(c or [])  # compute ONCE per chunk (not per feature)
+        rows.append([feats.get(n, 0.0) for n in feature_names])
+    absolute = np.asarray(rows, dtype=float)
     if not use_relative or absolute.shape[0] == 0:
         return absolute
     return np.hstack([absolute, batch_relative_matrix(absolute)])
