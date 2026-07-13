@@ -125,6 +125,7 @@ def _live_pivot(lgb_model, seq_model, feature_names, seq_weight, target_flag=0.1
                 chunks.append((json.loads(line).get("hands")) or [])
         if len(chunks) < 200:
             return None
+        chunks = chunks[-800:]  # most-recent window is enough; caps runtime
         rows = np.asarray(
             [[chunk_features(c).get(n, 0.0) for n in feature_names] for c in chunks],
             dtype=float,
@@ -208,6 +209,12 @@ def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--data-dir", default="data/benchmark")
     parser.add_argument("--out", default="poker44/model/artifacts")
+    parser.add_argument(
+        "--fast",
+        action="store_true",
+        help="Skip per-fold sequence OOF (the slow CV step) for auto-retrain; "
+        "still trains final LGBM+sequence and calibrates on live data. Much faster.",
+    )
     args = parser.parse_args()
 
     X, y, dates, splits, feature_names, encoded = load_dataset(
@@ -238,12 +245,16 @@ def main() -> None:
     assert not np.isnan(oof_lgb).any()
 
     # Blend with out-of-fold sequence-model scores (orthogonal action-order signal).
-    if seq_weight:
+    # Skipped in --fast mode: it's the slow CV step and only feeds the benchmark
+    # calibration fallback, which _live_pivot overrides from real live data.
+    if seq_weight and not args.fast:
         print("training sequence model per fold (out-of-fold)...")
         oof_seq = _sequence_oof(encoded, y, dates, folds)
         oof_raw = seq_weight * oof_seq + (1.0 - seq_weight) * oof_lgb
     else:
         oof_raw = oof_lgb
+        if args.fast:
+            print("fast mode: skipping per-fold sequence OOF")
 
     # Pass 2: single global pivot from blended OOF human scores, then evaluate.
     calib = calibrate(oof_raw, y)
@@ -258,7 +269,7 @@ def main() -> None:
     evaluate(oof_scores, y, "ALL (oof)")
 
     # --- Also respect the API's own train/validation split as a sanity check.
-    if (splits == "validation").any():
+    if (splits == "validation").any() and not args.fast:
         tr, va = splits != "validation", splits == "validation"
         model = fit_model(X[tr], y[tr])
         va_lgb = model.predict_proba(X[va])[:, 1]
@@ -288,16 +299,28 @@ def main() -> None:
     seq_path_saved = False
     final_seq = None
     if seq_weight:
-        idx = np.arange(len(y))
-        rng = np.random.RandomState(0)
-        rng.shuffle(idx)
-        cut = int(len(idx) * 0.9)
-        final_seq = train_sequence(
-            [encoded[i] for i in idx[:cut]], y[idx[:cut]],
-            [encoded[i] for i in idx[cut:]], y[idx[cut:]],
-        )
-        torch.save(final_seq.state_dict(), str(out_dir / "sequence.pt"))
-        seq_path_saved = True
+        seq_out = out_dir / "sequence.pt"
+        if args.fast and seq_out.exists():
+            # Reuse the existing sequence model. Action-order patterns are stable
+            # day-to-day, and retraining the GRU on CPU is the slow step; reusing
+            # it keeps the nightly auto-retrain fast and reliable (LGBM still
+            # retrains on fresh data, and the pivot recalibrates on live data).
+            from poker44.model.sequence import SequenceScorer
+
+            final_seq = SequenceScorer(seq_out).model
+            seq_path_saved = final_seq is not None
+            print(f"fast mode: reusing existing sequence.pt (loaded={seq_path_saved})")
+        else:
+            idx = np.arange(len(y))
+            rng = np.random.RandomState(0)
+            rng.shuffle(idx)
+            cut = int(len(idx) * 0.9)
+            final_seq = train_sequence(
+                [encoded[i] for i in idx[:cut]], y[idx[:cut]],
+                [encoded[i] for i in idx[cut:]], y[idx[cut:]],
+            )
+            torch.save(final_seq.state_dict(), str(seq_out))
+            seq_path_saved = True
 
     # --- Live-aware calibration: the operating point (0.5 threshold) must sit
     # on the REAL live distribution, not the benchmark (live scores run high, so

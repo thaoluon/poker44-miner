@@ -202,7 +202,7 @@ def maybe_retrain(latest: str | None) -> str:
     )
     if not ok:
         return f"retrain: download FAILED — {tail}"
-    ok, tail = run([PYTHON, "scripts/miner/train_model.py"], timeout=3600)
+    ok, tail = run([PYTHON, "scripts/miner/train_model.py", "--fast"], timeout=5400)
     if not ok:
         return f"retrain: train FAILED — {tail}"
     ok, tail = run(["pm2", "restart", PM2_NAME], timeout=120)
