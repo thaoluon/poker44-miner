@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from pathlib import Path
 
 import numpy as np
@@ -33,6 +34,13 @@ class DetectionModel:
         self.seq_scorer = None
         self.seq_weight = 0.0
         self.use_relative = False
+        # Calibration strategy. "pivot" (default) maps around a live pivot and
+        # applies a safety floor so >=1 chunk lands above 0.5. "clip_below"
+        # (UID-187 strategy) maps EVERY score below 0.5 in [0.05, 0.15],
+        # rank-preserving — flags nothing, betting the live reward is
+        # AP/rank-dominated and the human-safety gate does not zero when no
+        # chunk is flagged. Toggle without a retrain via POKER44_CALIB_MODE.
+        self.calib_mode = os.getenv("POKER44_CALIB_MODE", "pivot").strip().lower()
         self._load()
 
     def _load(self) -> None:
@@ -83,6 +91,27 @@ class DetectionModel:
         )
         return np.clip(scaled, 0.0, 1.0)
 
+    @staticmethod
+    def _clip_below(raw: np.ndarray) -> np.ndarray:
+        """UID-187 'clip_below': rank-preserving map into [0.05, 0.15] < 0.5.
+
+        Highest raw score -> 0.15, lowest -> 0.05. Flags nothing (no chunk
+        >= 0.5), so the ranking (AP/recall) is untouched but the miner never
+        predicts 'bot'. Pure calibration — reversible, no retrain.
+        """
+        n = raw.shape[0]
+        if n == 0:
+            return raw
+        out = np.empty(n, dtype=float)
+        if n == 1:
+            out[0] = 0.15
+            return out
+        order = np.argsort(-raw)  # highest raw first
+        for rank_idx, idx in enumerate(order):
+            t = rank_idx / (n - 1)
+            out[idx] = 0.15 - t * (0.15 - 0.05)
+        return out
+
     def score_chunks(self, chunks: list[list[dict]]) -> list[float]:
         """One calibrated bot-risk score in [0, 1] per chunk."""
         if not chunks:
@@ -108,6 +137,14 @@ class DetectionModel:
                         raw = self.seq_weight * seq + (1.0 - self.seq_weight) * raw
                 except Exception as err:  # noqa: BLE001
                     logger.error("sequence blend failed, LGBM-only: %s", err)
+            if self.calib_mode == "clip_below":
+                # Flag-nothing strategy: rank-preserving map, all scores < 0.5.
+                # Skips the pivot calibration and the safety floor entirely.
+                calibrated = self._clip_below(raw)
+                return [
+                    0.05 if is_degenerate else round(float(score), 6)
+                    for score, is_degenerate in zip(calibrated, degenerate)
+                ]
             calibrated = self._calibrate(raw)
             # Per-batch safety floor (drift-proofs the human-safety gate): the
             # validator needs >=1 chunk scored >=0.5 or the whole window's

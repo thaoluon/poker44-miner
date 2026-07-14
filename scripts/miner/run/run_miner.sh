@@ -42,6 +42,11 @@ export PYTHONPATH="$(pwd)"
 export POKER44_MODEL_REPO_URL="${POKER44_MODEL_REPO_URL:-https://github.com/thaoluon/poker44-miner}"
 export POKER44_MODEL_REPO_COMMIT="${POKER44_MODEL_REPO_COMMIT:-$(git -C "$(pwd)" rev-parse HEAD 2>/dev/null || echo '')}"
 
+# Calibration strategy for the final window (window 5) — UID-187 'clip_below'
+# adventure: flag nothing, let AP/rank carry the score. Reversible: unset this
+# (or set to 'pivot') and restart to return to the safe flag-~5% model.
+export POKER44_CALIB_MODE="${POKER44_CALIB_MODE:-clip_below}"
+
 MINER_ARGS=(
   --netuid "$NETUID"
   --wallet.name "$WALLET_NAME"
