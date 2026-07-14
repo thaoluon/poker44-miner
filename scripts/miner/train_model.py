@@ -46,9 +46,12 @@ except Exception:  # noqa: BLE001
     _SEQ_AVAILABLE = False
     BLEND_SEQ_WEIGHT = 0.0
 
-# Second feature view: within-batch rank-normalized features (magnitude-shift
-# invariant). Validated to lift simulated-live reward 0.857->0.898 (recall +0.086).
-USE_RELATIVE = True
+# Second feature view (within-batch rank-normalized). REVERTED 2026-07-14:
+# validated +0.04 on SIMULATED-live but on REAL live (window 4) it scored 0.480
+# vs the stable classifier's ~0.524 — sim-live did not predict real-live, and the
+# batch-relative features added harmful variance near the tight cutline. Keeping
+# the stable classifier + sequence blend, which reliably scored ~0.524-0.526.
+USE_RELATIVE = False
 
 
 def to_miner_view(group: list[dict]) -> list[dict]:
